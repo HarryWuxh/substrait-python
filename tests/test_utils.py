@@ -1,10 +1,16 @@
+import unittest
+from collections import Counter
+from unittest import mock
+
 import pytest
 import substrait.algebra_pb2 as stalg
 import substrait.extended_expression_pb2 as stee
 import substrait.extensions.extensions_pb2 as ste
 import substrait.plan_pb2 as stplan
 import substrait.type_pb2 as stt
+from google.protobuf import descriptor_pb2, descriptor_pool
 
+import substrait.utils as utils
 from substrait.utils import (
     iter_plan_rels,
     merge_extension_declarations,
@@ -488,3 +494,156 @@ def test_convert_is_idempotent():
     once = to_id_based_outer_references(plan)
     twice = to_id_based_outer_references(once)
     assert twice == once
+
+
+class ExpressionTraversalTest(unittest.TestCase):
+    def test_literal_payloads_are_not_expression_carriers(self):
+        rows = [
+            stalg.Expression.Nested.Struct(
+                fields=[
+                    stalg.Expression(
+                        literal=stalg.Expression.Literal(
+                            struct=stalg.Expression.Literal.Struct(
+                                fields=[stalg.Expression.Literal(string=str(index))]
+                            )
+                        )
+                    )
+                ]
+            )
+            for index in range(256)
+        ]
+        plan = _plan(
+            stalg.Rel(
+                read=stalg.ReadRel(
+                    virtual_table=stalg.ReadRel.VirtualTable(expressions=rows)
+                )
+            )
+        )
+        original_bytes = plan.SerializeToString(deterministic=True)
+        visits = Counter()
+        original = utils._iter_direct_subexpressions
+
+        def observe(message):
+            visits[message.DESCRIPTOR.full_name] += 1
+            yield from original(message)
+
+        with mock.patch.object(utils, "_iter_direct_subexpressions", observe):
+            self.assertEqual(list(iter_plan_rels(plan)), [plan.relations[0].root.input])
+        self.assertEqual(
+            sum(
+                count
+                for name, count in visits.items()
+                if name.startswith("substrait.Expression.Literal")
+            ),
+            0,
+        )
+        self.assertEqual(plan.SerializeToString(deterministic=True), original_bytes)
+
+    def test_subqueries_remain_visible_through_nested_carriers(self):
+        inner = _read("inner")
+        literal = stalg.Expression(literal=stalg.Expression.Literal(i64=1))
+        variants = {
+            "scalar": stalg.Expression.Subquery(
+                scalar=stalg.Expression.Subquery.Scalar(input=inner)
+            ),
+            "set_predicate": _exists(inner).subquery,
+            "set_comparison": stalg.Expression.Subquery(
+                set_comparison=stalg.Expression.Subquery.SetComparison(
+                    left=literal, right=inner
+                )
+            ),
+            "in_predicate": stalg.Expression.Subquery(
+                in_predicate=stalg.Expression.Subquery.InPredicate(
+                    needles=[literal], haystack=inner
+                )
+            ),
+        }
+        for name, subquery in variants.items():
+            nested = stalg.Expression(
+                nested=stalg.Expression.Nested(
+                    struct=stalg.Expression.Nested.Struct(
+                        fields=[stalg.Expression(subquery=subquery)]
+                    )
+                )
+            )
+            argument = stalg.FunctionArgument(value=nested)
+            carriers = {
+                "function": _filter(
+                    _read("outer"),
+                    stalg.Expression(
+                        scalar_function=stalg.Expression.ScalarFunction(
+                            arguments=[argument]
+                        )
+                    ),
+                ),
+                "sort": stalg.Rel(
+                    sort=stalg.SortRel(
+                        input=_read("outer"), sorts=[stalg.SortField(expr=nested)]
+                    )
+                ),
+                "aggregate": stalg.Rel(
+                    aggregate=stalg.AggregateRel(
+                        input=_read("outer"),
+                        measures=[
+                            stalg.AggregateRel.Measure(
+                                measure=stalg.AggregateFunction(arguments=[argument])
+                            )
+                        ],
+                    )
+                ),
+            }
+            for carrier, relation in carriers.items():
+                with self.subTest(subquery=name, carrier=carrier):
+                    tables = [
+                        list(rel.read.named_table.names)
+                        for rel in iter_plan_rels(_plan(relation))
+                        if rel.WhichOneof("rel_type") == "read"
+                    ]
+                    self.assertEqual(tables, [["outer"], ["inner"]])
+
+    def test_recursive_descriptors_and_declaration_order(self):
+        pool = descriptor_pool.DescriptorPool()
+
+        def add(file):
+            for dependency in file.dependencies:
+                add(dependency)
+            try:
+                pool.FindFileByName(file.name)
+            except KeyError:
+                pool.AddSerializedFile(file.serialized_pb)
+
+        add(stalg.DESCRIPTOR)
+        file = descriptor_pb2.FileDescriptorProto(
+            name="expression_carrier.proto",
+            package="expression_carrier",
+            dependency=[stalg.DESCRIPTOR.name],
+            syntax="proto3",
+        )
+        carrier = file.message_type.add(name="Carrier")
+        for name, number, target in (
+            ("cycle", 1, ".expression_carrier.Carrier"),
+            ("second", 3, ".substrait.Expression"),
+            ("first", 2, ".substrait.Expression"),
+            ("constant", 4, ".substrait.Expression.Literal"),
+            ("child", 5, ".substrait.Rel"),
+        ):
+            carrier.field.add(
+                name=name,
+                number=number,
+                label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+                type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+                type_name=target,
+            )
+        pool.AddSerializedFile(file.SerializeToString())
+        from google.protobuf.message_factory import GetMessageClass
+
+        cls = GetMessageClass(pool.FindMessageTypeByName("expression_carrier.Carrier"))
+        value = cls()
+        value.second.literal.i64 = 3
+        value.first.literal.i64 = 2
+        value.constant.i64 = 4
+        self.assertEqual(
+            [expr.literal.i64 for expr in utils._iter_direct_subexpressions(value)],
+            [3, 2],
+        )
+        self.assertEqual(list(utils._iter_direct_subexpressions(stt.Type())), [])

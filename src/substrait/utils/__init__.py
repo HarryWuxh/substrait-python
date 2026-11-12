@@ -2,6 +2,7 @@
 Utility and debugging functions for Substrait.
 """
 
+from functools import lru_cache
 from typing import Iterable
 
 import substrait.algebra_pb2 as stalg
@@ -176,6 +177,55 @@ def _inline_reference_rels_in_place(rel: stalg.Rel, subtrees) -> None:
             _inline_reference_rels_in_place(child, subtrees)
 
 
+@lru_cache(maxsize=128)
+def _expression_field_order(descriptor):
+    """Expression-carrying fields, without entering a child relation's scope.
+
+    Descriptors are immutable. Reachability is schema-dependent, not dependent on
+    the number of literal values in a message. A visited set handles recursive
+    wrapper types, while stopping at Rel preserves the owning relation's scope.
+    """
+
+    def contains_expression(root):
+        pending = [root]
+        seen = set()
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current.full_name == "substrait.Expression":
+                return True
+            if current.full_name == "substrait.Rel":
+                continue
+            pending.extend(
+                field.message_type
+                for field in current.fields
+                if field.message_type is not None
+                and not field.message_type.GetOptions().map_entry
+            )
+        return False
+
+    return {
+        field: index
+        for index, field in enumerate(descriptor.fields)
+        if field.message_type is not None
+        and not field.message_type.GetOptions().map_entry
+        and contains_expression(field.message_type)
+    }
+
+
+def _iter_expression_field_values(msg):
+    """Present carrier fields in declaration order, without scanning payloads."""
+    order = _expression_field_order(msg.DESCRIPTOR)
+    # ListFields is ordered by field number, which need not match declaration
+    # order. Restore the original walk order without inspecting constant payloads.
+    yield from sorted(
+        ((field, value) for field, value in msg.ListFields() if field in order),
+        key=lambda item: order[item[0]],
+    )
+
+
 def _iter_direct_subexpressions(msg):
     """Yield the immediate ``Expression`` messages owned by ``msg``.
 
@@ -188,24 +238,14 @@ def _iter_direct_subexpressions(msg):
     arguments (``measures[].measure.arguments[].value``) or a sort key
     (``sorts[].expr``).
     """
-    for field in msg.DESCRIPTOR.fields:
-        if field.message_type is None:
-            continue
-        if field.message_type.GetOptions().map_entry:
-            continue
+    for field, value in _iter_expression_field_values(msg):
         full = field.message_type.full_name
-        if field.is_repeated:
-            values = getattr(msg, field.name)
-            if full == "substrait.Expression":
-                yield from values
-            elif full != "substrait.Rel":
-                for value in values:
-                    yield from _iter_direct_subexpressions(value)
-        elif msg.HasField(field.name):
-            if full == "substrait.Expression":
-                yield getattr(msg, field.name)
-            elif full != "substrait.Rel":
-                yield from _iter_direct_subexpressions(getattr(msg, field.name))
+        values = value if field.is_repeated else (value,)
+        if full == "substrait.Expression":
+            yield from values
+        else:
+            for value in values:
+                yield from _iter_direct_subexpressions(value)
 
 
 def _iter_named_direct_expressions(node):
@@ -213,18 +253,9 @@ def _iter_named_direct_expressions(node):
     tagging each expression with the name of the top-level field on ``node`` it was
     reached through. Used to tell a join's ``post_join_filter`` (output-scoped) from
     its condition / ``residual_expression`` (combined-inputs-scoped)."""
-    for field in node.DESCRIPTOR.fields:
-        if field.message_type is None or field.message_type.GetOptions().map_entry:
-            continue
+    for field, value in _iter_expression_field_values(node):
         full = field.message_type.full_name
-        if full == "substrait.Rel":
-            continue
-        if field.is_repeated:
-            values = getattr(node, field.name)
-        elif node.HasField(field.name):
-            values = [getattr(node, field.name)]
-        else:
-            continue
+        values = value if field.is_repeated else (value,)
         for value in values:
             if full == "substrait.Expression":
                 yield field.name, value
