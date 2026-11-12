@@ -454,7 +454,9 @@ def nested_struct(
     def resolve(
         base_schema: stp.NamedStruct, registry: ExtensionRegistry
     ) -> stee.ExtendedExpression:
-        bound = [resolve_expression(item, base_schema, registry) for item in expressions]
+        bound = [
+            resolve_expression(item, base_schema, registry) for item in expressions
+        ]
         return stee.ExtendedExpression(
             referred_expr=[
                 stee.ExpressionReference(

@@ -10,7 +10,6 @@ from substrait.builders.extended_expression import (
 from substrait.extension_registry import ExtensionRegistry
 from substrait.type_inference import infer_extended_expression_schema
 
-
 named_struct = stt.NamedStruct(
     names=["left", "right", "occurred_at"],
     struct=stt.Type.Struct(
