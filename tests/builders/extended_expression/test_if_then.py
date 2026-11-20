@@ -3,6 +3,7 @@ import substrait.extended_expression_pb2 as stee
 import substrait.extensions.extensions_pb2 as ste
 import substrait.type_pb2 as stt
 
+from substrait.builders import type as types
 from substrait.builders.extended_expression import (
     column,
     if_then,
@@ -10,6 +11,7 @@ from substrait.builders.extended_expression import (
     scalar_function,
 )
 from substrait.extension_registry import ExtensionRegistry
+from substrait.type_inference import infer_expression_type
 
 struct = stt.Type.Struct(
     types=[
@@ -22,6 +24,70 @@ struct = stt.Type.Struct(
 named_struct = stt.NamedStruct(
     names=["order_id", "description", "order_total"], struct=struct
 )
+
+
+def test_nullable_return_branches_lift_only_the_literal_type():
+    schema = types.named_struct(
+        ["count"], types.struct([types.i64(True)], nullable=False)
+    )
+    condition = literal(False, types.boolean(False))
+    zero = literal(0, types.i64(False))(schema, None)
+    inner = if_then([(condition, zero)], column("count"))
+    outer = if_then(
+        [(condition, inner), (condition, zero)], literal(None, types.i64(True))
+    )
+
+    bound = outer(schema, None).referred_expr[0].expression
+    first, second = bound.if_then.ifs
+    inner_zero = first.then.if_then.ifs[0].then.literal
+    assert inner_zero.i64 == second.then.literal.i64 == 0
+    assert inner_zero.nullable and second.then.literal.nullable
+    assert not getattr(first, "if").literal.boolean
+    assert getattr(bound.if_then, "else").literal.WhichOneof("literal_type") == "null"
+    assert infer_expression_type(bound, schema.struct) == types.i64(True)
+    assert not zero.referred_expr[0].expression.literal.nullable
+    assert outer(schema, None).referred_expr[0].expression == bound
+
+    reverse = if_then([(condition, literal(None, types.i64(True)))], zero)
+    reversed_if = reverse(schema, None).referred_expr[0].expression.if_then
+    assert getattr(reversed_if, "else").literal.nullable
+
+
+def test_mixed_branches_stay_intact_if_a_required_branch_is_not_a_liftable_literal():
+    schema = types.named_struct(
+        ["count"], types.struct([types.i64(False)], nullable=False)
+    )
+    condition = literal(True, types.boolean(False))
+    conditional = (
+        if_then(
+            [(condition, literal(0, types.i64(False))), (condition, column("count"))],
+            literal(None, types.i64(True)),
+        )(schema, None)
+        .referred_expr[0]
+        .expression.if_then
+    )
+    assert not conditional.ifs[0].then.literal.nullable
+    assert conditional.ifs[1].then.HasField("selection")
+
+
+def test_literal_alignment_preserves_distinct_base_types_and_parameters():
+    from datetime import datetime
+
+    condition = literal(True, types.boolean(False))
+    for value, required, nullable in (
+        (0, types.i32(False), types.i64(True)),
+        (
+            datetime(2026, 11, 19),
+            types.precision_timestamp(6, False),
+            types.precision_timestamp(3, True),
+        ),
+    ):
+        conditional = if_then(
+            [(condition, literal(value, required))], literal(None, nullable)
+        )
+        bound = conditional(named_struct, None).referred_expr[0].expression
+        assert not bound.if_then.ifs[0].then.literal.nullable
+        assert infer_expression_type(bound, named_struct.struct) == required
 
 
 def test_if_else():
