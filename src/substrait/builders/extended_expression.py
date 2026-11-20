@@ -902,7 +902,9 @@ def _align_if_literal_branches(
     schema: stp.Type.Struct,
     registry: ExtensionRegistry,
 ) -> None:
-    branches = [clause.then for clause in conditional.ifs] + [getattr(conditional, "else")]
+    branches = [clause.then for clause in conditional.ifs] + [
+        getattr(conditional, "else")
+    ]
     # Literal inference does not preserve custom literal type variations.
     if any(branch.literal.type_variation_reference for branch in branches):
         return
@@ -918,7 +920,8 @@ def _align_if_literal_branches(
 
     try:
         branch_types = [
-            infer_expression_type(branch, schema, registry=registry) for branch in branches
+            infer_expression_type(branch, schema, registry=registry)
+            for branch in branches
         ]
     except Exception:
         # Some branches (e.g. relation-anchor references) need whole-plan context.
