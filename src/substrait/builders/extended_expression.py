@@ -14,7 +14,11 @@ import substrait.extensions.extensions_pb2 as ste
 import substrait.type_pb2 as stp
 
 from substrait.extension_registry import ExtensionRegistry
-from substrait.type_inference import infer_extended_expression_schema, outer_schemas
+from substrait.type_inference import (
+    infer_expression_type,
+    infer_extended_expression_schema,
+    outer_schemas,
+)
 from substrait.utils import (
     inline_reference_rels,
     merge_extension_declarations,
@@ -893,6 +897,51 @@ def window_function(
     return resolve
 
 
+def _align_if_literal_branches(
+    conditional: stalg.Expression.IfThen,
+    schema: stp.Type.Struct,
+    registry: ExtensionRegistry,
+) -> None:
+    branches = [clause.then for clause in conditional.ifs] + [
+        getattr(conditional, "else")
+    ]
+    # Literal inference does not preserve custom literal type variations.
+    if any(branch.literal.type_variation_reference for branch in branches):
+        return
+    required_literals = {
+        index
+        for index, branch in enumerate(branches)
+        if not branch.literal.nullable
+        and branch.literal.WhichOneof("literal_type")
+        not in (None, "null", "struct", "list", "map", "empty_list", "empty_map")
+    }
+    if not required_literals or len(required_literals) == len(branches):
+        return
+
+    try:
+        branch_types = [
+            infer_expression_type(branch, schema, registry=registry)
+            for branch in branches
+        ]
+    except Exception:
+        # Some branches (e.g. relation-anchor references) need whole-plan context.
+        # The optional lift must preserve the existing binding behavior in that case.
+        return
+    required_type = branch_types[min(required_literals)]
+    kind = required_type.WhichOneof("kind")
+    if kind is None:
+        return
+    nullable_type = stp.Type()
+    nullable_type.CopyFrom(required_type)
+    getattr(nullable_type, kind).nullability = stp.Type.NULLABILITY_NULLABLE
+    if nullable_type in branch_types and all(
+        branch_type == (required_type if index in required_literals else nullable_type)
+        for index, branch_type in enumerate(branch_types)
+    ):
+        for index in required_literals:
+            branches[index].literal.nullable = True
+
+
 def if_then(
     ifs: Iterable[tuple[ExtendedExpressionOrUnbound, ExtendedExpressionOrUnbound]],
     _else: ExtendedExpressionOrUnbound,
@@ -925,7 +974,7 @@ def if_then(
             bound_else.extensions,
         )
 
-        return stee.ExtendedExpression(
+        result = stee.ExtendedExpression(
             referred_expr=[
                 stee.ExpressionReference(
                     expression=stalg.Expression(
@@ -967,6 +1016,10 @@ def if_then(
             extension_urns=extension_urns,
             extensions=extensions,
         )
+        _align_if_literal_branches(
+            result.referred_expr[0].expression.if_then, base_schema.struct, registry
+        )
+        return result
 
     return resolve
 
